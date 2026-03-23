@@ -1,5 +1,5 @@
 define([], function () {
-  var WEBHOOK_URL = "https://webhook.site/ee5f90c0-44fd-49a8-9d57-4ebda535476a";
+  var WEBHOOK_URL = "https://webhook.site/fb9555c7-cb50-4b63-bc1b-1d9befffd87b";
   var COOKIE_ALLOWLIST = [
     "_ga",
     "_gid",
