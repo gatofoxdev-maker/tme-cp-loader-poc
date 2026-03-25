@@ -239,12 +239,76 @@ define([], function () {
     return out;
   }
 
-  function extractEmailTokenFromUrl(urlLike) {
-    var raw = normalizeString(urlLike);
-    var m = raw.match(/emailToken=([^\/?#]+)/i);
-    if (m && m[1]) {
-      return decodeURIComponent(m[1]);
+  function tryDecodeURIComponent(value) {
+    var input = normalizeString(value);
+    if (!input) {
+      return "";
     }
+    return safeCall(function () {
+      return decodeURIComponent(input);
+    }, input);
+  }
+
+  function sanitizeExtractedToken(token) {
+    return normalizeString(token).replace(/["'<>)\]}.,;:]+$/g, "");
+  }
+
+  function extractEmailTokenFromUrl(urlLike) {
+    var raw = normalizeString(urlLike).replace(/&amp;/gi, "&");
+    if (!raw) {
+      return "";
+    }
+
+    var queue = [raw];
+    var seen = {};
+
+    while (queue.length) {
+      var candidate = normalizeString(queue.shift());
+      if (!candidate || seen[candidate]) {
+        continue;
+      }
+      seen[candidate] = true;
+
+      var direct = candidate.match(/(?:[?&#]|^)emailToken=([^&#\s]+)/i);
+      if (direct && direct[1]) {
+        return sanitizeExtractedToken(tryDecodeURIComponent(direct[1]));
+      }
+
+      var encoded = candidate.match(/emailToken%3D([^&#\s]+)/i);
+      if (encoded && encoded[1]) {
+        return sanitizeExtractedToken(tryDecodeURIComponent(encoded[1]));
+      }
+
+      if (/^https?:\/\//i.test(candidate)) {
+        var parsed = safeCall(function () {
+          return new URL(candidate);
+        }, null);
+        if (parsed && parsed.searchParams) {
+          var entries = safeCall(function () {
+            return Array.from(parsed.searchParams.entries());
+          }, []);
+          for (var i = 0; i < entries.length; i++) {
+            var key = normalizeString(entries[i][0]).toLowerCase();
+            var value = normalizeString(entries[i][1]);
+            if (!value) {
+              continue;
+            }
+            if (key === "emailtoken") {
+              return sanitizeExtractedToken(tryDecodeURIComponent(value));
+            }
+            if (/emailtoken/i.test(value) || /^https?:\/\//i.test(value) || /%2f%2f/i.test(value)) {
+              queue.push(tryDecodeURIComponent(value));
+            }
+          }
+        }
+      }
+
+      var decoded = tryDecodeURIComponent(candidate);
+      if (decoded && decoded !== candidate) {
+        queue.push(decoded);
+      }
+    }
+
     return "";
   }
 
