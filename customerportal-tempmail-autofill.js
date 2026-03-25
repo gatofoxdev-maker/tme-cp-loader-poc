@@ -488,11 +488,14 @@ define([], function () {
             text = normalizeString(msg.text || msg.intro || "");
           }
 
-          var clickUrl = extractConfirmClickUrl(html + "\n" + text);
+          var messageBody = html + "\n" + text;
+          var clickUrl = extractConfirmClickUrl(messageBody);
           if (clickUrl) {
+            var tokenHint = extractEmailTokenFromUrl(clickUrl) || extractEmailTokenFromUrl(messageBody);
             return {
               messageId: id,
-              clickUrl: clickUrl
+              clickUrl: clickUrl,
+              emailToken: tokenHint
             };
           }
         }
@@ -831,7 +834,7 @@ define([], function () {
 
     upsertSpeechBalloon("Mailbox poll", "Waiting confirmation email in temp inbox...", false);
     var mailHit = await pollConfirmationClickUrl(mailbox);
-    var emailToken = extractEmailTokenFromUrl(mailHit.clickUrl);
+    var emailToken = normalizeString(mailHit.emailToken || extractEmailTokenFromUrl(mailHit.clickUrl));
     if (!emailToken) {
       throw new Error("confirmation_email_token_missing");
     }
